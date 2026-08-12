@@ -1036,6 +1036,7 @@ function sendChat() {
   const el = $('chat-input');
   const text = el.value.trim();
   if (!text) return;
+  if (!window.__storageOK) { tip('浏览器存储不可用，消息无法保存', false); return; }
   if (muteBlock()) return; // 封禁/禁言拦截
   const msgs = currentMsgs();
   msgs.push({ id: genId(), user: curUser, text, ts: Date.now() });
@@ -1053,6 +1054,7 @@ function pickFile() {
   inp.onchange = () => {
     const f = inp.files && inp.files[0];
     if (!f) return;
+    if (!window.__storageOK) { tip('浏览器存储不可用，消息无法保存', false); return; }
     if (muteBlock()) return; // 封禁/禁言拦截
     const err = checkFile(f, rules);
     if (err) { tip(err, false); return; }
@@ -1130,6 +1132,7 @@ function openNotePicker() {
   document.body.appendChild(mask);
 }
 function sendNoteMsg(n) {
+  if (!window.__storageOK) { tip('浏览器存储不可用，消息无法保存', false); return; }
   if (muteBlock()) return; // 封禁/禁言拦截
   const raw = n.content || '';
   const content = raw.slice(0, 3000) + (raw.length > 3000 ? '\n…（内容过长已截断）' : '');
@@ -1608,6 +1611,18 @@ document.addEventListener('keydown', e => {
 });
 
 /* ---------- 启动 ---------- */
+// 存储可用性自检：禁用存储的浏览器（部分微信内置浏览器/隐私模式）会静默丢数据
+window.__storageOK = true;
+try {
+  localStorage.setItem('__sn_test', '1');
+  localStorage.removeItem('__sn_test');
+} catch (e) {
+  window.__storageOK = false;
+  const d = document.createElement('div');
+  d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:rgba(200,30,40,0.95);color:#fff;font:bold 13px/1.6 "Segoe UI",sans-serif;padding:6px 10px;';
+  d.textContent = '⚠ 当前浏览器禁用了本地存储，账号/记事/聊天将无法保存！请更换浏览器或开启存储后重试。';
+  document.body.appendChild(d);
+}
 // 恢复上次主题（默认暗色）
 applyTheme(lsGet('sn_theme') || 'dark');
 setAuthMode('login');
