@@ -603,7 +603,7 @@
    功能：账号注册/登录 · 记事(自动时间+网络IP) · 本地聊天
    当前：全本地运行（localStorage + IndexedDB）
    ============================================================ */
-const GAME_VER = 'v1.5.0';
+const GAME_VER = 'v1.6.0';
 
 /* ---------- 安全的本地存储 ---------- */
 function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
@@ -611,9 +611,54 @@ function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 function lsDel(k) { try { localStorage.removeItem(k); } catch (e) {} }
 
 /* ============================================================
-   存储适配层（本地模式）
-   —— 后续同步服务器：只需把这几个 read/write 换成 fetch 请求，
-      UI 与业务逻辑无需任何改动
+   同步层：连接同步服务器（同源 /api），本地缓存 + 云端同步
+   服务器不可用时自动降级为纯本地模式
+   ============================================================ */
+let curToken = lsGet('sn_token') || '';
+function fetchJ(url, opts, ms) {
+  const hasAC = typeof AbortController !== 'undefined';
+  const ctrl = hasAC ? new AbortController() : null;
+  const t = setTimeout(() => { if (ctrl) ctrl.abort(); }, ms || 10000);
+  const o = Object.assign({}, opts || {});
+  if (ctrl) o.signal = ctrl.signal;
+  return fetch(url, o).finally(() => clearTimeout(t));
+}
+const Sync = {
+  on: false,
+  applying: false, // 拉取应用数据时抑制自动推送，防死循环
+  seen: {},
+  loadSeen() { try { Sync.seen = JSON.parse(lsGet('sn_sync') || '{}'); } catch (e) { Sync.seen = {}; } },
+  saveSeen() { lsSet('sn_sync', JSON.stringify(Sync.seen)); },
+  async api(path, opts) {
+    const o = Object.assign({ method: 'GET', headers: {} }, opts || {});
+    if (curToken) o.headers['X-Token'] = curToken;
+    if (o.body && typeof o.body !== 'string') { o.body = JSON.stringify(o.body); o.headers['Content-Type'] = 'application/json'; }
+    return fetchJ(path, o, 10000)
+      .then(r => r.json().then(j => ({ status: r.status, j })).catch(() => ({ status: r.status, j: {} })))
+      .catch(() => ({ status: 0, j: {} }));
+  },
+  async push(col, data) {
+    if (!Sync.on || !curToken) return false;
+    const r = await Sync.api('/api/col/' + encodeURIComponent(col), { method: 'POST', body: { data: data } });
+    if (r.status === 200) { Sync.seen[col] = r.j.v; Sync.saveSeen(); return true; }
+    return false;
+  },
+  async pull(col, apply) {
+    if (!Sync.on || !curToken) return false;
+    const r = await Sync.api('/api/col/' + encodeURIComponent(col));
+    if (r.status !== 200 || typeof r.j.v !== 'number') return false;
+    if ((Sync.seen[col] || 0) === r.j.v) return false;
+    Sync.applying = true;
+    try { apply(r.j.data); } finally { Sync.applying = false; }
+    Sync.seen[col] = r.j.v;
+    Sync.saveSeen();
+    return true;
+  }
+};
+
+/* ============================================================
+   存储适配层（本地缓存 + 云端推送）
+   —— 服务器同步已接入，UI 与业务逻辑无需任何改动
    ============================================================ */
 const Store = {
   users: {
@@ -626,11 +671,18 @@ const Store = {
   },
   notes: {
     read: user => { try { return JSON.parse(lsGet('sn_notes_' + user) || '[]'); } catch (e) { return []; } },
-    write: (user, v) => lsSet('sn_notes_' + user, JSON.stringify(v))
+    write: (user, v) => {
+      lsSet('sn_notes_' + user, JSON.stringify(v));
+      if (!Sync.applying && Sync.on) Sync.push('notes_' + user, v);
+    }
   },
   chat: {
     read: () => { try { return JSON.parse(lsGet('sn_chat') || '[]'); } catch (e) { return []; } },
-    write: v => lsSet('sn_chat', JSON.stringify(v.slice(-500))) // 最多保留 500 条
+    write: v => {
+      const d = v.slice(-500);
+      lsSet('sn_chat', JSON.stringify(d));
+      if (!Sync.applying && Sync.on) Sync.push('chat', d);
+    }
   },
   files: {
     // 文件本体存 IndexedDB（localStorage 只有 5MB）；后续同步服务器时改为 POST /api/files 上传
@@ -640,13 +692,21 @@ const Store = {
   friends: {
     // 好友关系：req=待处理申请(7天过期) ok=已通过的好友对
     read: () => { try { return JSON.parse(lsGet('sn_friends') || '{"req":[],"ok":[]}'); } catch (e) { return { req: [], ok: [] }; } },
-    write: v => lsSet('sn_friends', JSON.stringify(v))
+    write: v => {
+      lsSet('sn_friends', JSON.stringify(v));
+      if (!Sync.applying && Sync.on) Sync.push('friends', v);
+    }
   },
   priv: {
     // 私聊记录：按双方账号排序后分桶存储
     key: (a, b) => 'sn_priv_' + [a, b].sort().join('__'),
     read: (a, b) => { try { return JSON.parse(lsGet(Store.priv.key(a, b)) || '[]'); } catch (e) { return []; } },
-    write: (a, b, v) => lsSet(Store.priv.key(a, b), JSON.stringify(v.slice(-500)))
+    write: (a, b, v) => {
+      const k = Store.priv.key(a, b);
+      const d = v.slice(-500);
+      lsSet(k, JSON.stringify(d));
+      if (!Sync.applying && Sync.on) Sync.push('priv__' + [a, b].sort().join('__'), d);
+    }
   }
 };
 // IndexedDB 文件存储（可存大文件 Blob）
@@ -814,6 +874,7 @@ async function doRegister() {
   users.push({ name: name, salt: salt, hash: hash, created: Date.now(), role: name === 'iow123888' ? 2 : 0 });
   Store.users.write(users);
   enterApp(name);
+  tryCloudAuth('register', name, pass); // 云端注册（失败则本地模式）
 }
 async function doLogin() {
   const name = $('f-user').value.trim();
@@ -826,6 +887,58 @@ async function doLogin() {
   if (hash !== u.hash) return setErr('密码错误');
   if (isBannedUser(name)) return setErr('该账号已被封禁，无法登录');
   enterApp(name);
+  tryCloudAuth('login', name, pass); // 云端登录（失败则本地模式）
+}
+
+/* ---------- 云端认证与同步 ---------- */
+async function tryCloudAuth(mode, name, pass) {
+  try {
+    const r = await fetchJ('/api/' + mode, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name, pass: pass }) }, 8000);
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 200 && j.token) {
+      curToken = j.token;
+      lsSet('sn_token', j.token);
+      // 用服务器角色校准本地
+      const list = Store.users.read();
+      const u = list.find(x => x.name === name);
+      if (u && typeof j.role === 'number' && u.role !== j.role) { u.role = j.role; Store.users.write(list); }
+      Sync.on = true;
+      Sync.loadSeen();
+      await bootstrapSync();
+      tip('已连接云端，数据实时同步', true);
+    } else if (j.error) {
+      // 注册冲突 → 尝试登录；其余报错进本地模式
+      if (mode === 'register' && j.error.indexOf('已存在') >= 0) tryCloudAuth('login', name, pass);
+      else tip('云端：' + j.error + '（当前为本地模式）', false);
+    } else {
+      tip('无法连接同步服务器（当前为本地模式）', false);
+    }
+  } catch (e) {
+    tip('无法连接同步服务器（当前为本地模式）', false);
+  }
+}
+async function bootstrapSync() {
+  await syncPull();
+  renderChat();
+  renderNotes();
+  renderRooms();
+  renderFriendsView();
+  refreshUnreadUI(false);
+}
+// 拉取云端各集合（版本不同才应用）
+async function syncPull() {
+  const changed = {};
+  changed.chat = await Sync.pull('chat', d => { if (Array.isArray(d)) Store.chat.write(d); });
+  changed.friends = await Sync.pull('friends', d => { if (d && Array.isArray(d.req) && Array.isArray(d.ok)) Store.friends.write(d); });
+  changed.bans = await Sync.pull('bans', d => { if (d && typeof d === 'object') lsSet('sn_bans', JSON.stringify(d)); });
+  changed.mutes = await Sync.pull('mutes', d => { if (d && typeof d === 'object') lsSet('sn_mutes', JSON.stringify(d)); });
+  changed.notes = await Sync.pull('notes_' + curUser, d => { if (Array.isArray(d)) { notes = d; Store.notes.write(d); } });
+  if (changed.chat && roomType === 'group') renderChat();
+  if (changed.notes) renderNotes();
+  if (changed.chat || changed.friends) renderRooms();
+  if (changed.friends) renderFriendsView();
+  if (changed.chat || changed.friends) refreshUnreadUI(false);
+  return changed;
 }
 
 /* ---------- 进入 / 退出 ---------- */
@@ -848,11 +961,22 @@ function enterApp(name) {
     myIP = ip;
     $('my-ip').textContent = ipText(ip);
   });
+  // 尝试恢复云端会话（本地有 token 时）
+  curToken = lsGet('sn_token') || '';
+  Sync.loadSeen();
+  if (curToken) {
+    Sync.api('/api/col/chat').then(r => {
+      if (r.status === 200) { Sync.on = true; bootstrapSync(); }
+    });
+  }
 }
 function logout() {
   if (curNoteId) { flushSave(); }
   curUser = ''; curNoteId = null; notes = [];
   lastDots = null; lastPollUnread = {};
+  curToken = '';
+  lsDel('sn_token');
+  Sync.on = false;
   Store.session.write('');
   $('app-view').classList.remove('on');
   $('auth-view').style.display = 'flex';
@@ -1013,6 +1137,11 @@ function openRoom(type, peer) {
   $('chat-room-chip').textContent = roomFileRules().label + ' · 本地模式';
   $('chat-file').title = roomType === 'priv' ? '发送文件（任意格式，≤ 30MB，不过期）' : '发送文件（' + FILE_GROUP.join('/') + '，≤ 20MB，5 天后过期）';
   refreshUnreadUI(false);
+  // 私聊：从云端拉取该房间
+  if (type === 'priv' && Sync.on) {
+    const col = 'priv__' + [curUser, peer].sort().join('__');
+    Sync.pull(col, d => { if (Array.isArray(d)) Store.priv.write(curUser, peer, d); }).then(changed => { if (changed) renderChat(); });
+  }
 }
 function renderRooms() {
   const el = $('room-list');
@@ -1061,17 +1190,43 @@ function pickFile() {
     const fid = genId();
     const exp = rules.exp ? Date.now() + rules.exp : null;
     Store.files.save(fid, f.name, f, exp).then(() => {
-      const msgs = currentMsgs();
-      msgs.push({ id: genId(), user: curUser, text: '', ts: Date.now(), file: { id: fid, name: f.name, size: f.size, exp: exp } });
-      saveMsgs(msgs);
-      renderChat();
-      scrollChat();
-      tip('已发送：' + f.name, true);
+      // 同步到云端（失败则仅本地可用）
+      const readB64 = new Promise(res => {
+        const fr = new FileReader();
+        fr.onload = () => res(String(fr.result || '').split(',')[1] || '');
+        fr.onerror = () => res('');
+        fr.readAsDataURL(f);
+      });
+      readB64.then(b64 => {
+        if (Sync.on && b64) {
+          return Sync.api('/api/upload', { method: 'POST', body: { name: f.name, data: b64, exp: exp } })
+            .then(r => (r.status === 200 ? r.j.id : null))
+            .catch(() => null);
+        }
+        return null;
+      }).then(srvFid => {
+        const msgs = currentMsgs();
+        msgs.push({ id: genId(), user: curUser, text: '', ts: Date.now(), file: { id: fid, fid: srvFid, name: f.name, size: f.size, exp: exp } });
+        saveMsgs(msgs);
+        renderChat();
+        scrollChat();
+        tip('已发送：' + f.name, true);
+      });
     }).catch(() => tip('文件保存失败：浏览器存储不可用', false));
   };
   inp.click();
 }
-async function downloadFile(fid) {
+async function downloadFile(fid, srvFid) {
+  // 云端文件：服务器直下（同源）
+  if (srvFid) {
+    const a = document.createElement('a');
+    a.href = '/api/file/' + srvFid;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return;
+  }
   try {
     const rec = await Store.files.load(fid);
     if (!rec || !rec.blob) { tip('文件不存在或已被清理', false); return; }
@@ -1149,7 +1304,7 @@ function bubbleContent(m) {
     return '<div class="file-card">' +
       '<div class="file-ico">📎</div>' +
       '<div class="file-info"><div class="file-name">' + escHtml(m.file.name) + '</div><div class="file-size">' + fmtSize(m.file.size) + '</div></div>' +
-      '<button class="file-dl" data-dl="' + escHtml(m.file.id) + '">下载</button>' +
+      '<button class="file-dl" data-dl="' + escHtml(m.file.id) + '" data-fid-srv="' + escHtml(m.file.fid || '') + '">下载</button>' +
       (canDel ? '<button class="file-del" data-del-mid="' + escHtml(m.id) + '" data-del-fid="' + escHtml(m.file.id) + '">撤销</button>' : '') +
     '</div>';
   }
@@ -1183,7 +1338,7 @@ function renderChat() {
       '</div>' +
     '</div>';
   }).join('');
-  body.querySelectorAll('[data-dl]').forEach(btn => btn.addEventListener('click', () => downloadFile(btn.dataset.dl)));
+  body.querySelectorAll('[data-dl]').forEach(btn => btn.addEventListener('click', () => downloadFile(btn.dataset.dl, btn.dataset.fidSrv || '')));
   body.querySelectorAll('[data-del-mid]').forEach(btn => btn.addEventListener('click', () => deleteFileMsg(btn.dataset.delMid, btn.dataset.delFid)));
   body.querySelectorAll('[data-admindel]').forEach(btn => btn.addEventListener('click', () => adminDeleteMsg(btn.dataset.admindel, btn.dataset.fid || '')));
 }
@@ -1363,6 +1518,7 @@ function setBan(name, until) {
   const b = JSON.parse(lsGet('sn_bans') || '{}');
   if (until === null) delete b[name]; else b[name] = { until: until };
   lsSet('sn_bans', JSON.stringify(b));
+  if (Sync.on) Sync.push('bans', b);
 }
 function isBannedUser(name) {
   const x = banOf(name);
@@ -1376,6 +1532,7 @@ function setMute(name, until, perm) {
   if (until === null && !perm) delete m[name];
   else m[name] = perm ? { perm: true } : { until: until };
   lsSet('sn_mutes', JSON.stringify(m));
+  if (Sync.on) Sync.push('mutes', m);
 }
 function isMutedUser(name) {
   const x = muteOf(name);
@@ -1412,6 +1569,7 @@ function adminDeleteMsg(mid, fid) {
     arr.push(Date.now());
     log[curUser] = arr;
     lsSet('sn_adminlog', JSON.stringify(log));
+    if (Sync.on) Sync.push('adminlog', log);
   }
   const msgs = Store.chat.read();
   const m = msgs.find(x => x.id === mid);
@@ -1430,6 +1588,7 @@ function grantAdmin(name) {
   if (!u) return;
   u.role = 1;
   Store.users.write(users);
+  if (Sync.on) Sync.api('/api/grant', { method: 'POST', body: { name: name } });
   tip('已授予 ' + name + ' 管理员权限（蓝色图标）', true);
   renderFriendsView();
   renderRooms();
@@ -1602,6 +1761,8 @@ $('read-all').addEventListener('click', markAllRead);
 ['click', 'keydown', 'touchstart'].forEach(ev => document.addEventListener(ev, () => { if (!acInit) { acInit = true; ensureAC(); } }));
 // 新消息轮询：2 秒一次检测未读/红点/提示音
 setInterval(() => refreshUnreadUI(true), 2000);
+// 云端同步轮询：5 秒一次拉取远端变更
+setInterval(() => { if (Sync.on) syncPull(); }, 5000);
 // 跨标签页实时联动：另一个窗口（另一账号）发消息时立即刷新
 window.addEventListener('storage', e => {
   if (e.key && (e.key === 'sn_chat' || e.key.startsWith('sn_priv_') || e.key.startsWith('sn_friends'))) refreshUnreadUI(true);
